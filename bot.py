@@ -20,16 +20,6 @@ from telegram.ext import (
     filters,
 )
 
-# =========================
-# 配置
-# =========================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-if not BOT_TOKEN:
-    raise ValueError("请设置 BOT_TOKEN")
-
-DB_FILE = "data.db"
-TZ = ZoneInfo("Asia/Bangkok")
-
 # 固定时间
 FIXED_SUMMARY = time(10, 0)  # 10:00（不@）
 RESET_TIME = time(13, 0)     # 13:00 清零提示
