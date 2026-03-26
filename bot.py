@@ -24,6 +24,8 @@ from telegram.ext import (
 FIXED_SUMMARY = time(10, 0)  # 10:00（不@）
 RESET_TIME = time(13, 0)     # 13:00 清零提示
 
+DB_FILE = "data.db"
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
