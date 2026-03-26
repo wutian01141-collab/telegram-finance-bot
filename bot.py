@@ -786,10 +786,10 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 source_text=text,
             )
             msg = (
-                f"✅ 已识别模板\n"
+                f"✅ 已识别\n"
                 f"接待/客户：{format_party(data.get('receptionist', ''), data['customer'])}\n"
                 f"新单：{'是' if data['is_result'] else '否'}\n"
-                f"金额不计入统计"
+                f"✅已记录"
             )
             await update.message.reply_text(msg)
             return
