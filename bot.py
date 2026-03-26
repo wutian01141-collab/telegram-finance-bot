@@ -1,7 +1,9 @@
 # ================================
-# Telegram 出入款统计机器人（悟天）
-# 模板不记金额，只记客户和 Result
-# 收到/已出金额如果回复模板，则继承模板客户名
+# Telegram 出入款统计机器人（完整稳定版）
+# 支持：
+# 1. 图片+文字模板 / 纯文字模板
+# 2. 回复模板继承客户名
+# 3. 模板不记金额，只记收到/已出金额
 # ================================
 
 import os
@@ -27,13 +29,16 @@ if not BOT_TOKEN:
 DB_FILE = "data.db"
 TZ = ZoneInfo("Asia/Bangkok")
 
-FIXED_SUMMARY = time(10, 0)
-RESET_TIME = time(13, 0)
+FIXED_SUMMARY = time(10, 0)   # 10:00 自动汇总
+RESET_TIME = time(13, 0)      # 13:00 清零提示
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+# ================================
+# 数据库
+# ================================
 def db():
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
@@ -43,6 +48,7 @@ def db():
 def init_db():
     conn = db()
     c = conn.cursor()
+
     c.execute("""
     CREATE TABLE IF NOT EXISTS records (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,10 +61,14 @@ def init_db():
         period TEXT
     )
     """)
+
     conn.commit()
     conn.close()
 
 
+# ================================
+# 工具
+# ================================
 def now():
     return datetime.now(TZ)
 
@@ -71,10 +81,24 @@ def fmt_money(x):
     return f"{x:.2f} USDT"
 
 
+def message_text_content(message) -> str:
+    """
+    统一读取消息正文：
+    - 纯文字消息 -> text
+    - 图片+文字消息 -> caption
+    """
+    if not message:
+        return ""
+    return (getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()
+
+
 def add_record(chat_id, record_type, customer, amount, is_result):
     conn = db()
     conn.execute(
-        "INSERT INTO records (chat_id, type, customer, amount, is_result, time, period) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        """
+        INSERT INTO records (chat_id, type, customer, amount, is_result, time, period)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
         (
             chat_id,
             record_type,
@@ -89,13 +113,20 @@ def add_record(chat_id, record_type, customer, amount, is_result):
     conn.close()
 
 
+# ================================
+# 模板识别
+# ================================
 def parse_template(text: str):
     """
-    模板消息：
-    - 识别客户
-    - 识别 Result
-    - 不识别模板金额，不记入统计
+    模板只识别：
+    - 类型：入金 / 出款
+    - 客户
+    - Result -> 新单
+    不把模板里的金额记入统计
     """
+    if not text:
+        return None
+
     record_type = None
     if "入金" in text:
         record_type = "入金"
@@ -109,12 +140,14 @@ def parse_template(text: str):
         return None
 
     customer_raw = customer_match.group(1).strip()
+    customer_raw = customer_raw.splitlines()[0].strip()
     customer = customer_raw.split("/")[0].strip()
+
     is_result = 1 if re.search(r"\bResult\b", text, re.IGNORECASE) else 0
 
     return {
         "type": record_type,
-        "amount": 0.0,  # 模板金额不计入统计
+        "amount": 0.0,      # 模板金额不计入统计
         "customer": customer,
         "is_result": is_result,
         "template_only": True,
@@ -123,33 +156,45 @@ def parse_template(text: str):
 
 def extract_customer_from_reply(update: Update):
     """
-    如果金额消息是“回复某条模板消息”发送的，
-    则从被回复的模板中提取客户名。
+    从被回复的模板消息中提取客户名
+    支持：
+    - 纯文字模板（text）
+    - 图片+文字模板（caption）
     """
     if not update.message:
         return None
 
     reply = update.message.reply_to_message
-    if not reply or not reply.text:
+    if not reply:
         return None
 
-    text = reply.text.strip()
-    customer_match = re.search(r"客户\s*[:：]\s*(.+)", text)
+    raw_text = message_text_content(reply)
+    if not raw_text:
+        return None
+
+    customer_match = re.search(r"客户\s*[:：]\s*(.+)", raw_text)
     if not customer_match:
         return None
 
     customer_raw = customer_match.group(1).strip()
+    customer_raw = customer_raw.splitlines()[0].strip()
     customer = customer_raw.split("/")[0].strip()
-    return customer
+
+    return customer or None
 
 
+# ================================
+# 金额识别
+# ================================
 def parse_quick_amount(text: str, customer_name: str | None = None):
     """
-    只识别真正的金额消息：
+    只识别真正入统计的金额消息：
     - 收到99U / 收到 99u
     - 已出71.71u / 出款50U / 出50u
-    如果该消息是回复模板，则继承模板里的客户名。
     """
+    if not text:
+        return None
+
     t = text.strip()
 
     in_match = re.search(r"收到\s*([0-9]+(?:\.[0-9]+)?)\s*[uU]\b", t)
@@ -175,6 +220,9 @@ def parse_quick_amount(text: str, customer_name: str | None = None):
     return None
 
 
+# ================================
+# 汇总
+# ================================
 def summary_text(chat_id, p):
     rows = db().execute(
         "SELECT * FROM records WHERE chat_id=? AND period=? ORDER BY time ASC",
@@ -210,21 +258,44 @@ def summary_text(chat_id, p):
     return "\n".join(text)
 
 
+# ================================
+# 处理消息
+# ================================
 async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
+    if not update.message:
         return
 
-    text = update.message.text.strip()
+    text = message_text_content(update.message)
+    if not text:
+        return
+
     chat_id = update.effective_chat.id
 
-    # 先识别模板
+    # 1) 先尝试识别模板
     data = parse_template(text)
 
-    # 如果不是模板，再识别金额消息；金额消息优先继承“被回复模板”的客户名
+    # 2) 如果不是模板，再尝试识别金额消息
+    #    并优先从“被回复的模板”里继承客户名
     reply_customer = extract_customer_from_reply(update)
     if not data:
         data = parse_quick_amount(text, customer_name=reply_customer)
 
+    # 3) 如果金额消息还没取到客户名，则用“当前周期最近一条模板记录”兜底
+    if data and not data.get("template_only") and data["customer"] == "未命名客户":
+        last_template = db().execute(
+            """
+            SELECT customer FROM records
+            WHERE chat_id=? AND period=? AND amount=0
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (chat_id, period_key()),
+        ).fetchone()
+
+        if last_template and last_template["customer"]:
+            data["customer"] = last_template["customer"]
+
+    # 4) 入库
     if data:
         add_record(
             chat_id=chat_id,
@@ -252,7 +323,7 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg)
         return
 
-    # 直接输入客户名查询当前周期
+    # 5) 直接输入客户名，查询当前周期
     rows = db().execute(
         "SELECT DISTINCT customer FROM records WHERE chat_id=? AND period=?",
         (chat_id, period_key()),
@@ -261,7 +332,11 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if text in names:
         rows = db().execute(
-            "SELECT * FROM records WHERE chat_id=? AND period=? AND customer=?",
+            """
+            SELECT * FROM records
+            WHERE chat_id=? AND period=? AND customer=?
+            ORDER BY time ASC
+            """,
             (chat_id, period_key(), text),
         ).fetchall()
 
@@ -272,6 +347,9 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg)
 
 
+# ================================
+# 命令
+# ================================
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("机器人已启动")
 
@@ -283,7 +361,11 @@ async def summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def details(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rows = db().execute(
-        "SELECT * FROM records WHERE chat_id=? AND period=? ORDER BY time ASC",
+        """
+        SELECT * FROM records
+        WHERE chat_id=? AND period=?
+        ORDER BY time ASC
+        """,
         (update.effective_chat.id, period_key()),
     ).fetchall()
 
@@ -302,11 +384,12 @@ async def periods(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("当前版本先只展示当前周期，请用 /summary 查看")
 
 
+# ================================
+# 定时
+# ================================
 async def fixed_job(ctx: ContextTypes.DEFAULT_TYPE):
-    # 如果没有 chat_id，就不执行，避免报错
     if not ctx.job.chat_id:
         return
-
     chat_id = ctx.job.chat_id
     text = summary_text(chat_id, period_key())
     await ctx.bot.send_message(chat_id=chat_id, text=text)
@@ -325,6 +408,9 @@ async def reset_job(ctx: ContextTypes.DEFAULT_TYPE):
         )
 
 
+# ================================
+# 主程序
+# ================================
 def main():
     init_db()
 
