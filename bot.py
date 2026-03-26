@@ -1,5 +1,7 @@
 # ================================
 # Telegram 出入款统计机器人（悟天）
+# 模板不记金额，只记客户和 Result
+# 收到/已出金额如果回复模板，则继承模板客户名
 # ================================
 
 import os
@@ -88,6 +90,12 @@ def add_record(chat_id, record_type, customer, amount, is_result):
 
 
 def parse_template(text: str):
+    """
+    模板消息：
+    - 识别客户
+    - 识别 Result
+    - 不识别模板金额，不记入统计
+    """
     record_type = None
     if "入金" in text:
         record_type = "入金"
@@ -96,26 +104,52 @@ def parse_template(text: str):
     else:
         return None
 
-    amount_match = re.search(r"金额\s*[:：]\s*([0-9]+(?:\.[0-9]+)?)", text, re.IGNORECASE)
     customer_match = re.search(r"客户\s*[:：]\s*(.+)", text)
-
-    if not amount_match or not customer_match:
+    if not customer_match:
         return None
 
-    amount = round(float(amount_match.group(1)), 2)
     customer_raw = customer_match.group(1).strip()
     customer = customer_raw.split("/")[0].strip()
     is_result = 1 if re.search(r"\bResult\b", text, re.IGNORECASE) else 0
 
     return {
         "type": record_type,
-        "amount": amount,
+        "amount": 0.0,  # 模板金额不计入统计
         "customer": customer,
         "is_result": is_result,
+        "template_only": True,
     }
 
 
-def parse_quick_amount(text: str):
+def extract_customer_from_reply(update: Update):
+    """
+    如果金额消息是“回复某条模板消息”发送的，
+    则从被回复的模板中提取客户名。
+    """
+    if not update.message:
+        return None
+
+    reply = update.message.reply_to_message
+    if not reply or not reply.text:
+        return None
+
+    text = reply.text.strip()
+    customer_match = re.search(r"客户\s*[:：]\s*(.+)", text)
+    if not customer_match:
+        return None
+
+    customer_raw = customer_match.group(1).strip()
+    customer = customer_raw.split("/")[0].strip()
+    return customer
+
+
+def parse_quick_amount(text: str, customer_name: str | None = None):
+    """
+    只识别真正的金额消息：
+    - 收到99U / 收到 99u
+    - 已出71.71u / 出款50U / 出50u
+    如果该消息是回复模板，则继承模板里的客户名。
+    """
     t = text.strip()
 
     in_match = re.search(r"收到\s*([0-9]+(?:\.[0-9]+)?)\s*[uU]\b", t)
@@ -123,8 +157,9 @@ def parse_quick_amount(text: str):
         return {
             "type": "入金",
             "amount": round(float(in_match.group(1)), 2),
-            "customer": "未命名客户",
+            "customer": customer_name or "未命名客户",
             "is_result": 0,
+            "template_only": False,
         }
 
     out_match = re.search(r"(?:已出|出款|出)\s*([0-9]+(?:\.[0-9]+)?)\s*[uU]\b", t)
@@ -132,8 +167,9 @@ def parse_quick_amount(text: str):
         return {
             "type": "出款",
             "amount": round(float(out_match.group(1)), 2),
-            "customer": "未命名客户",
+            "customer": customer_name or "未命名客户",
             "is_result": 0,
+            "template_only": False,
         }
 
     return None
@@ -181,9 +217,13 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     chat_id = update.effective_chat.id
 
+    # 先识别模板
     data = parse_template(text)
+
+    # 如果不是模板，再识别金额消息；金额消息优先继承“被回复模板”的客户名
+    reply_customer = extract_customer_from_reply(update)
     if not data:
-        data = parse_quick_amount(text)
+        data = parse_quick_amount(text, customer_name=reply_customer)
 
     if data:
         add_record(
@@ -193,9 +233,26 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             amount=data["amount"],
             is_result=data["is_result"],
         )
-        await update.message.reply_text("✅ 已记录")
+
+        if data.get("template_only"):
+            msg = (
+                f"✅ 已识别模板\n"
+                f"客户：{data['customer']}\n"
+                f"新单：{'是' if data['is_result'] else '否'}\n"
+                f"金额不计入统计"
+            )
+        else:
+            msg = (
+                f"✅ 已记录\n"
+                f"类型：{data['type']}\n"
+                f"客户：{data['customer']}\n"
+                f"金额：{fmt_money(data['amount'])}"
+            )
+
+        await update.message.reply_text(msg)
         return
 
+    # 直接输入客户名查询当前周期
     rows = db().execute(
         "SELECT DISTINCT customer FROM records WHERE chat_id=? AND period=?",
         (chat_id, period_key()),
@@ -246,6 +303,10 @@ async def periods(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def fixed_job(ctx: ContextTypes.DEFAULT_TYPE):
+    # 如果没有 chat_id，就不执行，避免报错
+    if not ctx.job.chat_id:
+        return
+
     chat_id = ctx.job.chat_id
     text = summary_text(chat_id, period_key())
     await ctx.bot.send_message(chat_id=chat_id, text=text)
@@ -256,7 +317,12 @@ async def reset_job(ctx: ContextTypes.DEFAULT_TYPE):
     conn.execute("DELETE FROM records")
     conn.commit()
     conn.close()
-    await ctx.bot.send_message(chat_id=ctx.job.chat_id, text="🧹 此周期账单归零，并重新开始计算")
+
+    if ctx.job.chat_id:
+        await ctx.bot.send_message(
+            chat_id=ctx.job.chat_id,
+            text="🧹 此周期账单归零，并重新开始计算"
+        )
 
 
 def main():
@@ -269,9 +335,6 @@ def main():
     app.add_handler(CommandHandler("details", details))
     app.add_handler(CommandHandler("periods", periods))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
-
-    app.job_queue.run_daily(fixed_job, FIXED_SUMMARY)
-    app.job_queue.run_daily(reset_job, RESET_TIME)
 
     logger.info("Bot running...")
     app.run_polling()
