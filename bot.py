@@ -548,16 +548,34 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # 等待输入指定时间
     if ctx.user_data.get("awaiting_report_times"):
-        if not await is_group_admin(update, ctx):
-            ctx.user_data["awaiting_report_times"] = False
-            await update.message.reply_text("只有管理员可以设置指定时间")
-            return
+    if not await is_group_admin(update, ctx):
+        ctx.user_data["awaiting_report_times"] = False
+        await update.message.reply_text("只有管理员可以设置指定时间")
+        return
 
-        times_list = text.split()
+    times_list = text.split()
+
+    # 如果用户这条消息根本不像时间输入，就自动退出设置模式，
+    # 继续往下走正常模板/金额识别逻辑
+    all_valid = True
+    if not times_list:
+        all_valid = False
+    else:
         for t in times_list:
             if not re.fullmatch(r"([01]\d|2[0-3]):([0-5]\d)", t):
-                await update.message.reply_text("时间格式错误，请用 HH:MM，例如：00:00 04:00")
-                return
+                all_valid = False
+                break
+
+    if all_valid:
+        replace_report_times(chat_id, sorted(set(times_list)))
+        ensure_scheduled_for_chat(ctx.application, chat_id)
+        ctx.user_data["awaiting_report_times"] = False
+        log_action(chat_id, user.id, "set_report_times", " ".join(sorted(set(times_list))))
+        await update.message.reply_text("✅ 指定汇总时间已更新：\n" + "\n".join(sorted(set(times_list))))
+        return
+    else:
+        # 自动退出设置模式，不拦截后续正常消息
+        ctx.user_data["awaiting_report_times"] = False
 
         replace_report_times(chat_id, sorted(set(times_list)))
         ensure_scheduled_for_chat(ctx.application, chat_id)
