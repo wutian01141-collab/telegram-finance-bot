@@ -301,7 +301,7 @@ def parse_template(text: str):
         receptionist = receptionist_match.group(1).strip().splitlines()[0].strip()
 
     lower_text = text.lower()
-    is_result = 1 if ("result" in lower_text or "known" in lower_text) else 0
+    is_result = 1 if "result" in lower_text else 0
 
     return {
         "type": record_type,
