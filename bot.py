@@ -26,6 +26,11 @@ RESET_TIME = time(13, 0)     # 13:00 清零提示
 
 DB_FILE = "data.db"
 
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+
+if not BOT_TOKEN:
+    raise ValueError("请设置 BOT_TOKEN")
+    
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
