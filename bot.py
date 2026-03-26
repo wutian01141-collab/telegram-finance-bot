@@ -232,12 +232,17 @@ def summary_text(chat_id, p):
         (chat_id, p),
     ).fetchall()
 
-    ins = [r for r in rows if r["type"] == "入金"]
-    outs = [r for r in rows if r["type"] == "出款"]
+    # 只把真正有金额的记录用于入款/出款明细
+    money_rows = [r for r in rows if float(r["amount"] or 0) > 0]
+
+    ins = [r for r in money_rows if r["type"] == "入金"]
+    outs = [r for r in money_rows if r["type"] == "出款"]
 
     total_in = sum(r["amount"] for r in ins)
     total_out = sum(r["amount"] for r in outs)
     net = total_in - total_out
+
+    # 新单仍然统计全部记录里的 is_result
     result_count = sum(r["is_result"] for r in rows)
 
     def line(r):
@@ -365,14 +370,14 @@ async def details(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rows = db().execute(
         """
         SELECT * FROM records
-        WHERE chat_id=? AND period=?
+        WHERE chat_id=? AND period=? AND amount>0
         ORDER BY time ASC
         """,
         (update.effective_chat.id, period_key()),
     ).fetchall()
 
     if not rows:
-        await update.message.reply_text("当前周期没有记录")
+        await update.message.reply_text("当前周期没有金额记录")
         return
 
     msg = "📄 明细\n"
