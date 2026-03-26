@@ -648,22 +648,6 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             receptionist=(reply_info["receptionist"] if reply_info else None),
         )
 
-    # 兜底：当前周期最近一条模板
-    if data and not data.get("template_only") and data["customer"] == "未命名客户":
-        last_template = db().execute(
-            """
-            SELECT customer, receptionist FROM records
-            WHERE chat_id=? AND period=? AND amount=0
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (chat_id, period_key()),
-        ).fetchone()
-
-        if last_template and last_template["customer"]:
-            data["customer"] = last_template["customer"]
-            data["receptionist"] = last_template["receptionist"] or ""
-
     if data:
         # 模板
         if data.get("template_only"):
