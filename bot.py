@@ -1,9 +1,12 @@
 # ================================
-# Telegram 出入款统计机器人（完整稳定版）
-# 支持：
-# 1. 图片+文字模板 / 纯文字模板
-# 2. 回复模板继承客户名
-# 3. 模板不记金额，只记收到/已出金额
+# Telegram 出入款统计机器人（最终稳定版）
+# 作者：悟天
+# 功能：
+# 1. 支持纯文字模板 / 图片+配文模板
+# 2. 模板不记金额，只记客户和 Result
+# 3. 回复模板发送“收到99U / 已出50U”时，继承模板客户名
+# 4. 直接发送“收到99U / 已出50U”也可记录（客户默认为未命名客户）
+# 5. /summary /details /periods 可用
 # ================================
 
 import os
@@ -118,11 +121,11 @@ def add_record(chat_id, record_type, customer, amount, is_result):
 # ================================
 def parse_template(text: str):
     """
-    模板只识别：
-    - 类型：入金 / 出款
-    - 客户
-    - Result -> 新单
-    不把模板里的金额记入统计
+    模板消息：
+    - 识别类型：入金 / 出款
+    - 识别客户
+    - 识别 Result -> 新单
+    - 模板金额不计入统计
     """
     if not text:
         return None
@@ -143,11 +146,11 @@ def parse_template(text: str):
     customer_raw = customer_raw.splitlines()[0].strip()
     customer = customer_raw.split("/")[0].strip()
 
-    is_result = 1 if re.search(r"\bResult\b", text, re.IGNORECASE) else 0
+    is_result = 1 if "result" in text.lower() else 0
 
     return {
         "type": record_type,
-        "amount": 0.0,      # 模板金额不计入统计
+        "amount": 0.0,  # 模板金额不计入统计
         "customer": customer,
         "is_result": is_result,
         "template_only": True,
@@ -188,7 +191,7 @@ def extract_customer_from_reply(update: Update):
 # ================================
 def parse_quick_amount(text: str, customer_name: str | None = None):
     """
-    只识别真正入统计的金额消息：
+    只识别真正计入统计的金额消息：
     - 收到99U / 收到 99u
     - 已出71.71u / 出款50U / 出50u
     """
@@ -259,7 +262,7 @@ def summary_text(chat_id, p):
 
 
 # ================================
-# 处理消息
+# 消息处理
 # ================================
 async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.message:
@@ -271,16 +274,15 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     chat_id = update.effective_chat.id
 
-    # 1) 先尝试识别模板
+    # 先识别模板
     data = parse_template(text)
 
-    # 2) 如果不是模板，再尝试识别金额消息
-    #    并优先从“被回复的模板”里继承客户名
+    # 再识别金额消息，并优先继承“回复模板”的客户名
     reply_customer = extract_customer_from_reply(update)
     if not data:
         data = parse_quick_amount(text, customer_name=reply_customer)
 
-    # 3) 如果金额消息还没取到客户名，则用“当前周期最近一条模板记录”兜底
+    # 如果金额消息没拿到客户名，则用“当前周期最近一条模板记录”兜底
     if data and not data.get("template_only") and data["customer"] == "未命名客户":
         last_template = db().execute(
             """
@@ -295,7 +297,7 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if last_template and last_template["customer"]:
             data["customer"] = last_template["customer"]
 
-    # 4) 入库
+    # 入库
     if data:
         add_record(
             chat_id=chat_id,
@@ -323,7 +325,7 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg)
         return
 
-    # 5) 直接输入客户名，查询当前周期
+    # 直接输入客户名，查询当前周期
     rows = db().execute(
         "SELECT DISTINCT customer FROM records WHERE chat_id=? AND period=?",
         (chat_id, period_key()),
@@ -420,7 +422,7 @@ def main():
     app.add_handler(CommandHandler("summary", summary))
     app.add_handler(CommandHandler("details", details))
     app.add_handler(CommandHandler("periods", periods))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
+    app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, handle))
 
     logger.info("Bot running...")
     app.run_polling()
