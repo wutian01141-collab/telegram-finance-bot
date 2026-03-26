@@ -1,5 +1,5 @@
 # ================================
-# Telegram 出入款统计机器人（企业版完整最终版）
+# Telegram 出入款统计机器人（企业版最终稳定版）
 # 作者：悟天
 # ================================
 
@@ -28,7 +28,7 @@ DB_FILE = "data.db"
 TZ = ZoneInfo("Asia/Bangkok")
 
 # 固定时间
-FIXED_SUMMARY = time(10, 0)   # 10:00 自动汇总（不@）
+FIXED_SUMMARY = time(10, 0)   # 10:00 固定汇总（不@）
 RESET_TIME = time(12, 0)      # 12:00 自动清零
 DUP_SECONDS = 10              # 防重复窗口：10秒
 
@@ -65,15 +65,22 @@ def init_db():
         chat_id INTEGER,
         type TEXT,
         customer TEXT,
+        receptionist TEXT DEFAULT '',
         amount REAL,
         is_result INTEGER,
         time TEXT,
-        period TEXT
+        period TEXT,
+        source_message_id INTEGER,
+        source_user_id INTEGER,
+        source_text TEXT DEFAULT ''
     )
     """)
 
-    # 升级旧表
+    # 兼容旧表
     ensure_column(conn, "records", "receptionist", "receptionist TEXT DEFAULT ''")
+    ensure_column(conn, "records", "source_message_id", "source_message_id INTEGER")
+    ensure_column(conn, "records", "source_user_id", "source_user_id INTEGER")
+    ensure_column(conn, "records", "source_text", "source_text TEXT DEFAULT ''")
 
     c.execute("""
     CREATE TABLE IF NOT EXISTS chats (
@@ -105,17 +112,6 @@ def init_db():
     """)
 
     c.execute("""
-    CREATE TABLE IF NOT EXISTS admins (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        chat_id INTEGER,
-        user_id INTEGER,
-        username TEXT,
-        full_name TEXT,
-        UNIQUE(chat_id, user_id)
-    )
-    """)
-
-    c.execute("""
     CREATE TABLE IF NOT EXISTS action_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         chat_id INTEGER,
@@ -139,7 +135,7 @@ def now():
 
 def period_key(dt=None):
     dt = dt or now()
-    # 每天 12:00 之前算前一天周期
+    # 每天 12:00 前算前一天周期
     if dt.time() < RESET_TIME:
         base = dt.date() - timedelta(days=1)
     else:
@@ -203,6 +199,18 @@ def log_action(chat_id: int, user_id: int, action: str, detail: str):
 
 
 # ================================
+# 权限
+# ================================
+async def is_group_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat.type == ChatType.PRIVATE:
+        return True
+    member = await ctx.bot.get_chat_member(chat.id, user.id)
+    return member.status in ("creator", "administrator")
+
+
+# ================================
 # 记录写入 + 防重复
 # ================================
 def is_duplicate_record(chat_id: int, record_type: str, customer: str, receptionist: str, amount: float) -> bool:
@@ -210,7 +218,7 @@ def is_duplicate_record(chat_id: int, record_type: str, customer: str, reception
     row = conn.execute(
         """
         SELECT * FROM records
-        WHERE chat_id=? AND type=? AND customer=? AND receptionist=? AND amount=? AND period=?
+        WHERE chat_id=? AND type=? AND customer=? AND receptionist=? AND amount=? AND period=? AND amount>0
         ORDER BY id DESC
         LIMIT 1
         """,
@@ -229,12 +237,15 @@ def is_duplicate_record(chat_id: int, record_type: str, customer: str, reception
     return (now() - last_time).total_seconds() <= DUP_SECONDS
 
 
-def add_record(chat_id, record_type, customer, receptionist, amount, is_result):
+def add_record(chat_id, record_type, customer, receptionist, amount, is_result, source_message_id, source_user_id, source_text):
     conn = db()
     conn.execute(
         """
-        INSERT INTO records (chat_id, type, customer, receptionist, amount, is_result, time, period)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO records (
+            chat_id, type, customer, receptionist, amount, is_result, time, period,
+            source_message_id, source_user_id, source_text
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             chat_id,
@@ -245,6 +256,9 @@ def add_record(chat_id, record_type, customer, receptionist, amount, is_result):
             is_result,
             now().isoformat(),
             period_key(),
+            source_message_id,
+            source_user_id,
+            source_text or "",
         ),
     )
     conn.commit()
@@ -257,19 +271,19 @@ def add_record(chat_id, record_type, customer, receptionist, amount, is_result):
 def parse_template(text: str):
     """
     模板识别：
-    - 识别类型：入金 / 出款
+    - 识别类型：入金 / 出金 / 出款
     - 识别客户
     - 识别接待
-    - 识别 Result -> 新单
-    - 不计模板金额
+    - 识别 Result / Known -> 新单
+    - 模板金额不计入统计
     """
     if not text:
         return None
 
     record_type = None
-    if "入金" in text:
+    if "入金" in text or "入款" in text:
         record_type = "入金"
-    elif "出款" in text:
+    elif "出金" in text or "出款" in text:
         record_type = "出款"
     else:
         return None
@@ -286,7 +300,8 @@ def parse_template(text: str):
     if receptionist_match:
         receptionist = receptionist_match.group(1).strip().splitlines()[0].strip()
 
-    is_result = 1 if "result" in text.lower() else 0
+    lower_text = text.lower()
+    is_result = 1 if ("result" in lower_text or "known" in lower_text) else 0
 
     return {
         "type": record_type,
@@ -337,6 +352,7 @@ def parse_quick_amount(text: str, customer_name: str | None = None, receptionist
 
     t = text.strip()
 
+    # 入款
     in_match = re.search(r"收到\s*([0-9]+(?:\.[0-9]+)?)\s*[uU]\b", t)
     if in_match:
         return {
@@ -348,6 +364,7 @@ def parse_quick_amount(text: str, customer_name: str | None = None, receptionist
             "template_only": False,
         }
 
+    # 出款
     out_match = re.search(r"(?:已出|出款|出)\s*([0-9]+(?:\.[0-9]+)?)\s*[uU]\b", t)
     if out_match:
         return {
@@ -360,6 +377,46 @@ def parse_quick_amount(text: str, customer_name: str | None = None, receptionist
         }
 
     return None
+
+
+# ================================
+# 修改金额（回调）
+# 用法：回复原金额消息，发送：
+# 修改为20U
+# 改为20U
+# ================================
+def parse_edit_amount(text: str):
+    if not text:
+        return None
+    m = re.search(r"(?:修改为|改为)\s*([0-9]+(?:\.[0-9]+)?)\s*[uU]\b", text.strip())
+    if not m:
+        return None
+    return round(float(m.group(1)), 2)
+
+
+def find_record_by_replied_message(chat_id: int, reply_message_id: int):
+    conn = db()
+    row = conn.execute(
+        """
+        SELECT * FROM records
+        WHERE chat_id=? AND source_message_id=? AND amount>0
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (chat_id, reply_message_id),
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def update_record_amount(record_id: int, new_amount: float):
+    conn = db()
+    conn.execute(
+        "UPDATE records SET amount=? WHERE id=?",
+        (new_amount, record_id),
+    )
+    conn.commit()
+    conn.close()
 
 
 # ================================
@@ -431,18 +488,6 @@ def get_report_times(chat_id: int):
 
 
 # ================================
-# 权限
-# ================================
-async def is_group_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
-    chat = update.effective_chat
-    user = update.effective_user
-    if chat.type == ChatType.PRIVATE:
-        return True
-    member = await ctx.bot.get_chat_member(chat.id, user.id)
-    return member.status in ("creator", "administrator")
-
-
-# ================================
 # 汇总
 # ================================
 def summary_text(chat_id, p):
@@ -470,10 +515,12 @@ def summary_text(chat_id, p):
     text.append("📊 汇总\n")
     text.append(f"📅 周期：{period_range_text(p)}\n")
 
+    # 入款在上
     text.append("💰 入款：")
     text += [line(r) for r in ins] or ["无"]
     text.append(f"总入款：{fmt_money(total_in)}\n")
 
+    # 出款在下
     text.append("💸 出款：")
     text += [line(r) for r in outs] or ["无"]
     text.append(f"总出款：-{fmt_money(total_out)}\n")
@@ -529,7 +576,7 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if text == "设置指定时间":
         if await is_group_admin(update, ctx):
             ctx.user_data["awaiting_report_times"] = True
-            await update.message.reply_text("请直接发送时间，例如：00:00 04:00 08:30")
+            await update.message.reply_text("请直接发送时间，例如：00:00 04:00 08:30，或发送 /cancel 退出")
         else:
             await update.message.reply_text("只有管理员可以设置指定时间")
         return
@@ -548,46 +595,51 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # 等待输入指定时间
     if ctx.user_data.get("awaiting_report_times"):
-    if not await is_group_admin(update, ctx):
-        ctx.user_data["awaiting_report_times"] = False
-        await update.message.reply_text("只有管理员可以设置指定时间")
-        return
+        if not await is_group_admin(update, ctx):
+            ctx.user_data["awaiting_report_times"] = False
+            await update.message.reply_text("只有管理员可以设置指定时间")
+            return
 
-    times_list = text.split()
+        times_list = text.split()
 
-    # 如果用户这条消息根本不像时间输入，就自动退出设置模式，
-    # 继续往下走正常模板/金额识别逻辑
-    all_valid = True
-    if not times_list:
-        all_valid = False
-    else:
-        for t in times_list:
-            if not re.fullmatch(r"([01]\d|2[0-3]):([0-5]\d)", t):
-                all_valid = False
-                break
+        all_valid = True
+        if not times_list:
+            all_valid = False
+        else:
+            for t in times_list:
+                if not re.fullmatch(r"([01]\d|2[0-3]):([0-5]\d)", t):
+                    all_valid = False
+                    break
 
-    if all_valid:
-        replace_report_times(chat_id, sorted(set(times_list)))
-        ensure_scheduled_for_chat(ctx.application, chat_id)
-        ctx.user_data["awaiting_report_times"] = False
-        log_action(chat_id, user.id, "set_report_times", " ".join(sorted(set(times_list))))
-        await update.message.reply_text("✅ 指定汇总时间已更新：\n" + "\n".join(sorted(set(times_list))))
-        return
-    else:
-        # 自动退出设置模式，不拦截后续正常消息
-        ctx.user_data["awaiting_report_times"] = False
+        if all_valid:
+            replace_report_times(chat_id, sorted(set(times_list)))
+            ensure_scheduled_for_chat(ctx.application, chat_id)
+            ctx.user_data["awaiting_report_times"] = False
+            log_action(chat_id, user.id, "set_report_times", " ".join(sorted(set(times_list))))
+            await update.message.reply_text("✅ 指定汇总时间已更新：\n" + "\n".join(sorted(set(times_list))))
+            return
+        else:
+            # 自动退出设置模式，继续正常识别消息
+            ctx.user_data["awaiting_report_times"] = False
 
-        replace_report_times(chat_id, sorted(set(times_list)))
-        ensure_scheduled_for_chat(ctx.application, chat_id)
-        ctx.user_data["awaiting_report_times"] = False
-        log_action(chat_id, user.id, "set_report_times", " ".join(sorted(set(times_list))))
-        await update.message.reply_text("✅ 指定汇总时间已更新：\n" + "\n".join(sorted(set(times_list))))
-        return
+    # 先处理“修改金额”
+    new_amount = parse_edit_amount(text)
+    if new_amount is not None and update.message.reply_to_message:
+        original = find_record_by_replied_message(chat_id, update.message.reply_to_message.message_id)
+        if original:
+            old_amount = float(original["amount"] or 0)
+            update_record_amount(original["id"], new_amount)
+            party = format_party(original["receptionist"], original["customer"])
+            log_action(chat_id, user.id, "edit_amount", f"{old_amount} -> {new_amount} | {party}")
+            await update.message.reply_text(
+                f"✅ 已修改成功\n类型：{original['type']}\n接待/客户：{party}\n原金额：{fmt_money(old_amount)}\n新金额：{fmt_money(new_amount)}"
+            )
+            return
 
-    # 模板
+    # 模板识别
     data = parse_template(text)
 
-    # 回复模板继承接待/客户
+    # 金额识别，并优先从回复模板继承
     reply_info = extract_template_info_from_reply(update)
     if not data:
         data = parse_quick_amount(
@@ -596,7 +648,7 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             receptionist=(reply_info["receptionist"] if reply_info else None),
         )
 
-    # 兜底：当前周期最近模板
+    # 兜底：当前周期最近一条模板
     if data and not data.get("template_only") and data["customer"] == "未命名客户":
         last_template = db().execute(
             """
@@ -613,6 +665,7 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             data["receptionist"] = last_template["receptionist"] or ""
 
     if data:
+        # 模板
         if data.get("template_only"):
             add_record(
                 chat_id=chat_id,
@@ -621,6 +674,9 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 receptionist=data.get("receptionist", ""),
                 amount=0.0,
                 is_result=data["is_result"],
+                source_message_id=update.message.message_id,
+                source_user_id=user.id,
+                source_text=text,
             )
             msg = (
                 f"✅ 已识别模板\n"
@@ -631,7 +687,7 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(msg)
             return
 
-        # 金额记录防重复
+        # 防重复
         if is_duplicate_record(
             chat_id=chat_id,
             record_type=data["type"],
@@ -649,6 +705,9 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             receptionist=data.get("receptionist", ""),
             amount=data["amount"],
             is_result=data["is_result"],
+            source_message_id=update.message.message_id,
+            source_user_id=user.id,
+            source_text=text,
         )
 
         msg = (
@@ -704,28 +763,24 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ================================
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
-    user = update.effective_user
-
     ensure_chat(chat.id, chat.title or chat.full_name or str(chat.id), chat.type)
     ensure_scheduled_for_chat(ctx.application, chat.id)
 
     text = (
         "机器人已启动\n\n"
         "管理员按钮：汇总 / 当前 / 设置指定时间 / 清零\n"
-        "支持：图片+文字模板、回复模板继承接待/客户、只统计收到/已出金额"
+        "支持：图片+文字模板、回复模板继承接待/客户、只统计收到/已出金额、回复原金额消息可修改金额"
     )
 
     if await is_group_admin(update, ctx):
-        conn = db()
-        conn.execute("""
-        INSERT OR IGNORE INTO admins(chat_id, user_id, username, full_name)
-        VALUES (?, ?, ?, ?)
-        """, (chat.id, user.id, user.username or "", user.full_name or str(user.id)))
-        conn.commit()
-        conn.close()
         await update.message.reply_text(text, reply_markup=admin_keyboard())
     else:
         await update.message.reply_text(text)
+
+
+async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data["awaiting_report_times"] = False
+    await update.message.reply_text("已退出设置指定时间模式")
 
 
 async def summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -967,6 +1022,7 @@ async def post_init(app: Application):
         BotCommand("unsetalert", "取消提醒人员（回复某人）"),
         BotCommand("alertlist", "查看提醒人员"),
         BotCommand("resetall", "手动清零"),
+        BotCommand("cancel", "退出设置状态"),
     ]
     await app.bot.set_my_commands(commands)
 
@@ -983,6 +1039,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("summary", summary))
     app.add_handler(CommandHandler("current", current))
     app.add_handler(CommandHandler("details", details))
